@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ray
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.utils import EngineZmqAddresses
@@ -36,6 +38,7 @@ class DPLlumletActor:
         local_dp_rank: int = 0,
     ):
         # vLLM engine core
+        logger.info("try to pull up DPEngineCoreActor")
         self.backend_engine = DPEngineCoreActor(
             vllm_config, on_head_node, addresses, executor_class,
             log_stats, dp_rank, local_dp_rank)
@@ -66,3 +69,11 @@ class DPLlumletActor:
             raise
         finally:
             self.shutdown()
+
+    def get_node_ip(self):
+        node_id = ray.get_runtime_context().get_node_id()
+        nodes = ray.nodes()
+        for node in nodes:
+            if node["NodeID"] == node_id:
+                return node["NodeManagerAddress"]
+        return None

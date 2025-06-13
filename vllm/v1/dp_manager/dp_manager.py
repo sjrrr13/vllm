@@ -20,30 +20,31 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import vllm.envs as envs
 from vllm import AsyncEngineArgs
 from vllm.logger import init_logger
-from vllm.entrypoints.openai.api_server import setup_server
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.dp_manager.coordinator_actor import DPCoordinatorActor
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.dp_manager.llumlet_actor import DPLlumletActor
+from vllm.v1.engine.core import DPEngineCoreActor
 from vllm.v1.dp_manager.server_actor import ServerActor
-from vllm.v1.dp_manager.utils import initialize_placement_group
+from vllm.v1.dp_manager.utils import (initialize_placement_group, 
+                                      wait_for_completion_or_failure)
 from vllm.v1.utils import (EngineZmqAddresses, get_engine_client_zmq_addr)
 
 logger = init_logger(__name__)
 
 
-class DPManagerActor:
+class DPManager:
     """Manager actor used for data-parallel deployments (DP>1).
 
     This actor acts as the centralized component for dp instance 
     pull-up, coordination and fault tolerance.
 
     * Both the pull-up and handshake of ServerActor and Llumlet 
-      are done within the DPManagerActor constructor, so that once 
-      the DPManagerActor is successfully pulled up, the entire ep 
+      are done within the DPManager constructor, so that once 
+      the DPManager is successfully pulled up, the entire EP 
       unit is completely ready.
 
-    * The DPManagerActor is also responsible for the fault tolerance 
+    * The DPManager is also responsible for the fault tolerance 
        of the entire ep unit deployment.
     
     """
@@ -51,8 +52,6 @@ class DPManagerActor:
         # Process args
         num_api_servers = args.api_server_count
         assert num_api_servers > 0
-
-        listen_address, sock = setup_server(args)
 
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
@@ -89,11 +88,14 @@ class DPManagerActor:
             logger.info(
                 "Ray is already initialized. Skipping Ray initialization")
         else:
-            ray.init()
+            ray.init(resources={"driver_node": 1})
 
+        # TODO: set using args
+        num_cpus = 64
+        num_gpus = 4
         # TODO: test without DP
-        pg = initialize_placement_group(
-            "pg", args.num_cpus, args.num_gpus, parallel_config)
+        pg, local_dp_ranks = initialize_placement_group(
+            "pg", num_cpus, num_gpus, parallel_config)
 
         # Set up input and output addresses.
         input_addresses = [
@@ -123,11 +125,12 @@ class DPManagerActor:
                     placement_group=pg,
                     placement_group_bundle_index=0)
             ).remote(parallel_config)
+            ray.get(pg.ready())
             # TODO: break coordinator's link
-            addresses.coordinator_input, addresses.coordinator_output = (
-                coordinator.get_engine_socket_addresses().remote())
+            addresses.coordinator_input, addresses.coordinator_output = \
+                ray.get(coordinator.get_engine_socket_addresses.remote())
             stats_update_address = \
-                coordinator.get_stats_publish_address().remote()
+                ray.get(coordinator.get_stats_publish_address.remote())
             logger.info(f"Started DPCoordinator actor at "
                         f"{ray.get(coordinator.get_node_ip.remote())}")
             
@@ -138,35 +141,37 @@ class DPManagerActor:
         local_engine_count = \
             vllm_config.parallel_config.data_parallel_size_local
 
-        for i in range(1, dp_size+1):
+        for i in range(dp_size):
             dp_vllm_config = copy.deepcopy(vllm_config)
             on_head_node = i < local_engine_count
             # TODO: local_index (local_dp_rank)
-            local_index = 0
+            local_index = local_dp_ranks[i]
 
             # Pull-up Llumlet actor
             llumlet_actor = ray.remote(DPLlumletActor).options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
-                    placement_group_bundle_index=i)
-            ).remote(
-                vllm_config=dp_vllm_config,
-                executor_class=executor_class,
-                log_stats=log_stats,
-                on_head_node=on_head_node,
-                addresses=addresses,
-                dp_rank=i,
-                local_dp_rank=local_index)
-            llumlet_actors.append(llumlet_actor)
+                    placement_group_bundle_index=i+1,
+                )).remote(vllm_config=dp_vllm_config,
+                          executor_class=executor_class,
+                          log_stats=log_stats,
+                          on_head_node=on_head_node,
+                          addresses=addresses,
+                          dp_rank=i,
+                          local_dp_rank=local_index)
+            llumlet_actors.append(llumlet_actor.wait_for_init.remote())
+        ray.get(llumlet_actors)
 
+        logger.info("Llumlet actors init finished")
+            
+        for i in range(dp_size):
             # Pull-up ServerActor
+            logger.info(f"try init ServerActor {i}")
             server_actor = ray.remote(ServerActor).options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
-                    placement_group_bundle_index=0)
+                    placement_group_bundle_index=i+1)
             ).remote(
-                listen_address=listen_address,
-                sock=sock,
                 args=args,
                 input_address=input_addresses[i],
                 output_address=output_addresses[i],
@@ -175,9 +180,15 @@ class DPManagerActor:
             )
             server_actors.append(server_actor)
 
-        ray.get(llumlet_actors)
-        ray.get(server_actors)
+        # for i in range(dp_size):
+            # logger.info(f"Started Llumlet actor {i} at "
+            #             f"{ray.get(llumlet_actors[i].get_node_ip.remote())}")
+            # logger.info(f"Started Server actor {i} at "
+            #             f"{ray.get(server_actor[i].get_node_ip.remote())}")
 
         # Check initialization completion
+        wait_for_completion_or_failure()
+
+        logger.info("DPManager Launche finished")
 
         return

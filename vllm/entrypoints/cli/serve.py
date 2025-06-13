@@ -33,6 +33,8 @@ from vllm.v1.utils import (APIServerProcessManager, CoreEngine,
                            wait_for_completion_or_failure,
                            wait_for_engine_startup)
 
+from vllm.v1.dp_manager.dp_manager import DPManager
+
 logger = init_logger(__name__)
 
 
@@ -51,6 +53,9 @@ class ServeSubcommand(CLISubcommand):
 
         if args.headless or args.api_server_count < 1:
             run_headless(args)
+        elif args.dp_manager_launcher:
+            logger.info("Using DPManager as Launcher")
+            dp_manager = DPManager(args)
         elif args.api_server_count > 1:
             run_multi_api_server(args)
         else:
@@ -99,6 +104,11 @@ class ServeSubcommand(CLISubcommand):
             "Must be a YAML with the following options:"
             "https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#cli-reference"
         )
+
+        serve_parser.add_argument('--dp-manager-launcher',
+                                  action='store_true',
+                                  default=False,
+                                  help="Launch vLLM using DPManager.")
 
         serve_parser = make_arg_parser(serve_parser)
         show_filtered_argument_or_group_from_help(serve_parser, "serve")

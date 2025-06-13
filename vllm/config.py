@@ -1833,6 +1833,7 @@ class ParallelConfig:
         from vllm.distributed.utils import (
             stateless_init_torch_distributed_process_group)
 
+        logger.info(f"{self.data_parallel_master_ip=}, {self.get_next_dp_init_port()=}, {self.data_parallel_rank=}, {self.data_parallel_size=}")
         # use gloo since the engine process might not have cuda device
         dp_group = stateless_init_torch_distributed_process_group(
             self.data_parallel_master_ip,
@@ -1840,7 +1841,7 @@ class ParallelConfig:
             self.data_parallel_rank,
             self.data_parallel_size,
             backend="gloo")
-
+        logger.info("finish creating dp_group")
         return dp_group
 
     @staticmethod

@@ -403,7 +403,8 @@ class CoreEngineActorManager:
 
         for node in nodes:
             node_ip = node.node_ip
-            node_resources = available_resources[node.node_id]
+            nid = list(available_resources.keys())[0]
+            node_resources = available_resources[nid]
             # For now, each DP rank can only be assigned to one node
             # TODO(rui): support allocating a single DP rank
             # to multiple nodes

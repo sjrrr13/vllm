@@ -506,6 +506,7 @@ def stateless_init_torch_distributed_process_group(
     prefix_store = PrefixStore(init_method, store)
 
     if backend == "gloo":
+        logger.info(f"try to ini gloo process group, {group_rank=}, {group_size=}")
         return init_gloo_process_group(backend=backend,
                                        prefix_store=prefix_store,
                                        group_rank=group_rank,

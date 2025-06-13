@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict
+from typing import Dict, List
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -68,6 +68,7 @@ def initialize_placement_group(
     dp_master_ip = parallel_config.data_parallel_master_ip
     dp_size = parallel_config.data_parallel_size
     world_size = parallel_config.world_size
+    local_dp_ranks: List[int] = []
 
     try:
         # Create a new placement group
@@ -77,8 +78,8 @@ def initialize_placement_group(
                     "The number of required CPUs/GPUs for data parallelism "
                     "exceeds the total number of available in the cluster.")
             placement_group_specs = \
-                [{"CPU": 1, "node:" + dp_master_ip: 0.001}] + \
-                [{"CPU": 2, "GPU": world_size} * dp_size]
+                [{"CPU": 1, "driver_node": 1}] + \
+                [{"CPU": 2, "GPU": world_size}] * dp_size
 
         elif num_gpus >= 1:
             # bundle_0: All CPU Actors + Worker_0, 
@@ -120,4 +121,64 @@ def initialize_placement_group(
                          f"{placement_group_name}, unexpected exception: {e}")
         return None
 
-    return current_placement_group
+    local_dp_ranks = [0, 1]
+    return current_placement_group, local_dp_ranks
+
+
+def wait_for_completion_or_failure(
+        api_server_manager: APIServerProcessManager,
+        engine_manager: Optional[Union[CoreEngineProcManager,
+                                       CoreEngineActorManager]] = None,
+        coordinator: Optional["DPCoordinator"] = None) -> None:
+    try:
+        logger.info("Waiting for API servers to complete ...")
+        # Create a mapping of sentinels to their corresponding processes
+        # for efficient lookup
+        sentinel_to_proc: dict[Any, BaseProcess] = {
+            proc.sentinel: proc
+            for proc in api_server_manager.processes
+        }
+
+        if coordinator:
+            sentinel_to_proc[coordinator.proc.sentinel] = coordinator.proc
+
+        actor_run_refs = []
+        if isinstance(engine_manager, CoreEngineProcManager):
+            for proc in engine_manager.processes:
+                sentinel_to_proc[proc.sentinel] = proc
+        elif isinstance(engine_manager, CoreEngineActorManager):
+            actor_run_refs = engine_manager.get_run_refs()
+
+        # Check if any process terminates
+        while sentinel_to_proc or actor_run_refs:
+            # Wait for any process to terminate
+            ready_sentinels: list[Any] = connection.wait(sentinel_to_proc,
+                                                         timeout=5)
+
+            # Process any terminated processes
+            for sentinel in ready_sentinels:
+                proc = sentinel_to_proc.pop(sentinel)
+
+                # Check if process exited with error
+                if proc.exitcode != 0:
+                    raise RuntimeError(
+                        f"Process {proc.name} (PID: {proc.pid}) "
+                        f"died with exit code {proc.exitcode}")
+
+            if actor_run_refs:
+                import ray
+                _, actor_run_refs = ray.wait(actor_run_refs, timeout=5)
+
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, shutting down API servers...")
+    except Exception as e:
+        logger.exception("Exception occurred while running API servers: %s",
+                         str(e))
+        raise
+    finally:
+        logger.info("Terminating remaining processes ...")
+        api_server_manager.close()
+        if coordinator:
+            coordinator.close()
+        if engine_manager:
+            engine_manager.close()

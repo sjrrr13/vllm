@@ -379,13 +379,17 @@ class EngineCoreProc(EngineCore):
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
 
+        logger.info("Try to handshake")
         with self._perform_handshake(handshake_address, identity, on_head_node,
                                      vllm_config) as addresses:
+            logger.info(f"{addresses=}")
             self.client_count = len(addresses.outputs)
 
             # Set up data parallel environment.
             self.has_coordinator = addresses.coordinator_output is not None
+            logger.info(f"{self.has_coordinator=}")
             self._init_data_parallel(vllm_config)
+            logger.info("wait for data parallel init")
 
             super().__init__(vllm_config, executor_class, log_stats,
                              executor_fail_callback)
@@ -779,6 +783,7 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         dp_size = vllm_config.parallel_config.data_parallel_size
         local_dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+        logger.info(f"{dp_rank=}, {dp_size=}, {local_dp_rank=}")
 
         assert dp_size > 1
         assert 0 <= local_dp_rank <= dp_rank < dp_size
@@ -795,13 +800,16 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.platforms import current_platform
         device_control_env_var = current_platform.device_control_env_var
         world_size = vllm_config.parallel_config.world_size
+        logger.info(f"{world_size=}")
         os.environ[device_control_env_var] = ",".join(
             str(current_platform.device_id_to_physical_device_id(i))
             for i in range(local_dp_rank * world_size, (local_dp_rank + 1) *
                            world_size))
 
         self.dp_rank = dp_rank
+        logger.info(f"{self.dp_rank=}")
         self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
+        logger.info(f"{self.dp_group=}")
 
     def shutdown(self):
         super().shutdown()
@@ -913,6 +921,7 @@ class DPEngineCoreActor(DPEngineCoreProc):
         vllm_config.parallel_config.data_parallel_rank = dp_rank
         vllm_config.parallel_config.data_parallel_rank_local = \
             local_dp_rank
+        logger.info(f"{vllm_config.parallel_config.data_parallel_rank_local=}")
 
         # Ray sets CUDA_VISIBLE_DEVICES to empty string,
         # we clean this up to be able to properly initialize
@@ -959,3 +968,13 @@ class DPEngineCoreActor(DPEngineCoreProc):
             raise
         finally:
             self.shutdown()
+
+    def get_node_ip(self):
+        import ray
+        
+        node_id = ray.get_runtime_context().get_node_id()
+        nodes = ray.nodes()
+        for node in nodes:
+            if node["NodeID"] == node_id:
+                return node["NodeManagerAddress"]
+        return None

@@ -11,16 +11,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
 import argparse
+import uvloop
 import multiprocessing
 import weakref
 from typing import Any, Optional
 
+import ray
+
 from vllm.logger import init_logger
-from vllm.entrypoints.cli.serve import run_api_server_worker_proc
+from vllm.entrypoints.openai.api_server import setup_server
 from vllm.v1.utils import shutdown
+from vllm.executor.multiproc_worker_utils import _add_prefix
+from vllm.entrypoints.openai.api_server import run_server_worker
 
 logger = init_logger(__name__)
+
+
+def run_api_server_worker_proc(listen_address,
+                               sock,
+                               args,
+                               client_config=None,
+                               **uvicorn_kwargs) -> None:
+    """Entrypoint for individual API server worker processes."""
+
+    # Add process-specific prefix to stdout and stderr.
+    from multiprocessing import current_process
+    process_name = current_process().name
+    pid = os.getpid()
+    _add_prefix(sys.stdout, process_name, pid)
+    _add_prefix(sys.stderr, process_name, pid)
+
+    uvloop.run(
+        run_server_worker(listen_address, sock, args, client_config,
+                          **uvicorn_kwargs))
 
 
 class ServerActor:
@@ -31,8 +57,6 @@ class ServerActor:
 
     def __init__(
         self,
-        listen_address: str,
-        sock: Any,
         args: argparse.Namespace,
         input_address: list[str],
         output_address: list[str],
@@ -51,6 +75,9 @@ class ServerActor:
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address 
         """
+        
+        listen_address, sock = setup_server(args)
+        
         self.listen_address = listen_address
         self.sock = sock
         self.args = args
@@ -64,15 +91,16 @@ class ServerActor:
         if stats_update_address is not None:
             client_config["stats_update_address"] = stats_update_address
 
+        # logger.info("try get spawn_context")
         spawn_context = multiprocessing.get_context("spawn")
+        logger.info("try launch Process")
         proc = spawn_context.Process(target=run_api_server_worker_proc,
                                      name=f"ApiServer_{client_index}",
                                      args=(listen_address, sock, args,
                                            client_config))
-        self.processes.append(proc)
         proc.start()
         
-        logger.info("Started %d API server processes", len(self.processes))
+        logger.info(f"Started API server processes {client_index}")
 
         # Shutdown only the API server processes on garbage collection
         # The extra processes are managed by their owners
@@ -80,3 +108,11 @@ class ServerActor:
 
     def close(self) -> None:
         self._finalizer()
+
+    def get_node_ip(self):
+        node_id = ray.get_runtime_context().get_node_id()
+        nodes = ray.nodes()
+        for node in nodes:
+            if node["NodeID"] == node_id:
+                return node["NodeManagerAddress"]
+        return None
